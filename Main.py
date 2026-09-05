@@ -1,12 +1,26 @@
-from lxml import etree
+"""PCL-style Minecraft mod batch analyzer."""
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from os import path
-import xlwings as xw
-import requests
-import re
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import json
 import os
-import zipfile
+import re
+import threading
 import time
-from typing import Optional
+import zipfile
+
+try:
+    from lxml import etree
+except ImportError:
+    etree = None
+
+import requests
+try:
+    import xlwings as xw
+except ImportError:
+    xw = None
 
 
 MAX_RETRIES = 3
@@ -14,212 +28,559 @@ REQUEST_TIMEOUT = (5, 15)
 MAX_REQUESTS_PER_SECOND = 50
 RETRY_BACKOFF_SECONDS = 1
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/109.0.0.0 Safari/537.36 Edg/109.0.1518.70"
-)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+OUTPUT_HEADERS = [
+    "序号", "Mod 文件名", "Mod ID", "名称", "中文名", "作者", "Minecraft 版本",
+    "加载器", "客户端安装", "服务端安装", "简介", "来源链接", "匹配置信度", "查询状态",
+]
+LOADERS = ("Forge", "NeoForge", "Fabric", "Quilt")
+SOURCE_DOMAINS = {"MC百科": "mcmod.cn", "Modrinth": "modrinth.com", "CurseForge": "curseforge.com"}
+SOURCE_SEARCH_SCOPES = {
+    "MC百科": "mcmod.cn",
+    "Modrinth": "modrinth.com",
+    "CurseForge": "curseforge.com/minecraft/mc-mods",
+}
+SHEET_COLUMN_WIDTHS = {
+    "A:A": 7, "B:B": 34, "C:C": 22, "D:D": 24, "E:E": 20, "F:F": 18,
+    "G:G": 20, "H:H": 12, "I:I": 14, "J:J": 14, "K:K": 48, "L:L": 48,
+    "M:M": 18, "N:N": 36,
+}
+WRAPPED_COLUMNS = {"B:B", "K:K", "L:L", "N:N"}
+
+
+@dataclass
+class JarMetadata:
+    mod_ids: List[str] = field(default_factory=list)
+    names: List[str] = field(default_factory=list)
+    authors: List[str] = field(default_factory=list)
+    description: str = ""
+    versions: List[str] = field(default_factory=list)
+    loader: str = "未知"
+    error: str = ""
+
+    @property
+    def multiple(self):
+        return len(self.mod_ids) > 1
+
+
+@dataclass
+class SearchCandidate:
+    source: str
+    url: str
+    name: str = ""
+    slug: str = ""
+    project_id: str = ""
+    chinese_name: str = ""
+    authors: List[str] = field(default_factory=list)
+    description: str = ""
+    versions: List[str] = field(default_factory=list)
+    loaders: List[str] = field(default_factory=list)
+    client_side: str = ""
+    server_side: str = ""
+    score: int = 0
+    confirmed: bool = False
+    source_urls: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SearchResult:
+    source: str
+    status: str = "未找到"
+    candidates: List[SearchCandidate] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "请求失败"
+
+
+@dataclass
+class ModRecord:
+    filename: str
+    metadata: JarMetadata
+    candidate: Optional[SearchCandidate] = None
+    candidates: List[SearchCandidate] = field(default_factory=list)
+    confidence: str = "未找到"
+    status: List[str] = field(default_factory=list)
+
+
+def normalize_identifier(value: str) -> str:
+    return re.sub(r"[ _-]+", "", (value or "").strip().casefold())
+
+
+def unique(values: Iterable[str]) -> List[str]:
+    result = []
+    for value in values:
+        value = str(value or "").strip()
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def map_side(value: str, side: str) -> str:
+    return {"required": side + "需装", "optional": side + "可选", "unsupported": side + "无效"}.get((value or "").lower(), "未知")
+
+
+def derive_search_terms(filename: str, metadata: JarMetadata) -> List[str]:
+    stem = path.splitext(path.basename(filename))[0]
+    stem = re.sub(r"^\[[^]]+\]\s*", "", stem)
+    stem = re.sub(r"【[^】]+】", "", stem).strip()
+    stem = re.sub(r"^[\u4e00-\u9fff]+[ _.-]+", "", stem)
+    clean = re.sub(r"(?:[-+_]?(?:mc)?\d+(?:\.\d+){1,3})", "", stem, flags=re.I)
+    clean = re.sub(r"[-+_]?(?:neo)?forge|[-+_]?(?:fabric|quilt)", "", clean, flags=re.I)
+    primary_id = metadata.mod_ids[:1]
+    primary_name = metadata.names[:1]
+    other_names = metadata.names[1:]
+    return unique(primary_id + primary_name + [clean.strip(" _-"), stem] + other_names)[:5]
+
+
+def extract_versions(value: str) -> List[str]:
+    return unique(re.findall(r"(?:1\.\d+(?:\.\d+)?|\d+\.\d+(?:\.\d+)?)", value or ""))
+
+
+def versions_from_text(content: str) -> List[str]:
+    return extract_versions(content)
+
+
+def dependency_values(value) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [item for entry in value for item in dependency_values(entry)]
+    if isinstance(value, dict):
+        for key in ("versionRange", "versions", "version"):
+            if key in value:
+                return dependency_values(value[key])
+    return []
+
+
+def toml_minecraft_versions(content: str) -> List[str]:
+    versions = []
+    blocks = re.split(r"\[\[dependencies\.[^]]+]]", content)[1:]
+    for block in blocks:
+        mod_id = re.search(r"^\s*modId\s*=\s*[\"']([^\"']+)", block, re.M)
+        if not mod_id or mod_id.group(1).casefold() != "minecraft":
+            continue
+        version_range = re.search(r"^\s*versionRange\s*=\s*[\"']([^\"']+)", block, re.M)
+        if version_range:
+            versions.append(version_range.group(1))
+    return unique(versions)
+
+
+def json_minecraft_versions(data: dict, loader: str) -> List[str]:
+    root = data.get("quilt_loader", {}) if loader == "Quilt" else data
+    dependencies = root.get("depends", {}) if isinstance(root, dict) else {}
+    if isinstance(dependencies, dict):
+        return unique(dependency_values(dependencies.get("minecraft", [])))
+    if isinstance(dependencies, list):
+        values = []
+        for dependency in dependencies:
+            if isinstance(dependency, dict) and str(dependency.get("id", "")).casefold() == "minecraft":
+                values.extend(dependency_values(dependency))
+        return unique(values)
+    return []
+
+
+def source_url_host(url: str) -> str:
+    match = re.match(r"https?://([^/]+)", url or "", re.I)
+    return re.sub(r"^www\.", "", match.group(1).lower()) if match else ""
+
+
+def is_allowed_url(url: str, source: str) -> bool:
+    host = source_url_host(url)
+    domain = SOURCE_DOMAINS[source]
+    return host == domain or host.endswith("." + domain)
 
 
 class Manager:
-    def __init__(self, modFilePath):
-        self.filename2Simple = {}
-        self.filename2Real = {}
+    def __init__(self, mod_directory: str):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self._last_request_time = None
-
+        self._request_lock = threading.Lock()
         try:
-            self._analyze_mods(modFilePath)
+            self.analyze_directory(mod_directory)
         finally:
             self.session.close()
 
-    def _analyze_mods(self, modFilePath):
-        files = os.listdir(modFilePath)
-        num = 1
-        xb = xw.Book()
-        xs = xb.sheets["Sheet1"]
-        xs.range(num, 2).value = "Mod文件名"
-        xs.range(num, 3).value = "Mod信息页名"
-        xs.range(num, 4).value = "Mod信息"
-        xs.range(num, 5).value = "Mod搜索名"
-        xs.range(num, 6).value = "是否为Forge Mod"
-
-        for file in files:
-            num += 1
-            fileName = path.basename(file)
-            isForgeMod = self.isForgeMod(fileName)
-            modName = self.getModName(fileName)
-            if not modName:
-                modName = self.simplifyName(fileName)
-            self.filename2Simple[fileName] = modName
-
-            searchSucceeded = self.loadSearchWeb(modName, fileName)
-            if not searchSucceeded:
-                self._write_result_row(xs, num, num - 1, fileName, "", "", modName, isForgeMod)
-                print(fileName, "->", modName, ": 网络请求失败，已跳过")
-                continue
-
-            searchResultDic = self.getModname2UrlDic()
-            if not searchResultDic:
-                self._write_result_row(xs, num, num - 1, fileName, "查无此mod", "\\", modName, isForgeMod)
-                print(fileName, "->", modName, ": 查无此mod")
-                continue
-
-            modInfoName = list(searchResultDic.keys())[0]
-            modInfoSide = self.isServerNeeded(list(searchResultDic.values())[0], fileName)
-            if modInfoSide is None:
-                self._write_result_row(xs, num, num - 1, fileName, modInfoName, "", modName, isForgeMod)
-                print(fileName, "->", modName, "->", modInfoName, ": 网络请求失败，已跳过")
-                continue
-
-            self._write_result_row(xs, num, num - 1, fileName, modInfoName, modInfoSide, modName, isForgeMod)
-            print(fileName, "->", modName, "->", modInfoName, ":", modInfoSide)
-        xb.save("result.xlsx")
+    def analyze_directory(self, mod_directory: str):
+        if xw is None:
+            raise RuntimeError("生成 Excel 需要安装 xlwings")
+        files = os.listdir(mod_directory)
+        jar_files = [filename for filename in files if filename.lower().endswith(".jar")]
+        skipped_files = [filename for filename in files if not filename.lower().endswith(".jar")]
+        print(f"[开始] 发现 {len(jar_files)} 个 JAR，准备分析。")
+        for filename in skipped_files:
+            print(f"[跳过] {filename}: 非 JAR 文件。")
+        workbook = xw.Book()
+        sheet = workbook.sheets["Sheet1"]
+        sheet.range(1, 1).value = OUTPUT_HEADERS
+        row = 1
+        completed = 0
+        for filename in jar_files:
+            row += 1
+            metadata = self.read_jar_metadata(path.join(mod_directory, filename))
+            if metadata.error:
+                print(f"[元数据异常] {filename}: {metadata.error}。")
+            elif metadata.multiple:
+                print(f"[元数据提示] {filename}: 多 Mod JAR，需人工审核。")
+            try:
+                record = self.analyze_jar(filename, metadata)
+            except Exception as error:
+                print(f"[文件失败] {filename}: {type(error).__name__}。")
+                record = ModRecord(filename=filename, metadata=metadata, confidence="请求失败", status=["MC百科=请求失败", "Modrinth=请求失败", "Bing=请求失败", "CurseForge=请求失败"])
+            sheet.range(row, 1).value = self.record_values(row - 1, record)
+            completed += 1
+            self.log_record(record)
+        self.format_sheet(sheet, row)
+        workbook.save("result.xlsx")
+        print(f"[完成] 已处理 {completed} 个 JAR，结果已保存至 result.xlsx。")
 
     @staticmethod
-    def _write_result_row(sheet, row, index, file_name, info_name, info, search_name, is_forge_mod):
-        sheet.range(row, 1).value = index
-        sheet.range(row, 2).value = file_name
-        sheet.range(row, 3).value = info_name
-        sheet.range(row, 4).value = info
-        sheet.range(row, 5).value = search_name
-        sheet.range(row, 6).value = is_forge_mod
+    def log_record(record: ModRecord):
+        metadata = record.metadata
+        local = ", ".join(filter(None, ["/".join(metadata.mod_ids), metadata.loader, "/".join(metadata.versions)])) or "未识别本地元数据"
+        result_name = record.candidate.name if record.candidate else "未找到可信候选"
+        print(f"[结果] {record.filename} -> {local} -> {result_name} | {record.confidence} | {'；'.join(record.status)}")
 
-    def _wait_for_rate_limit(self):
-        interval = 1 / MAX_REQUESTS_PER_SECOND
-        now = time.monotonic()
-        if self._last_request_time is not None:
-            wait_time = interval - (now - self._last_request_time)
-            if wait_time > 0:
-                time.sleep(wait_time)
-        self._last_request_time = time.monotonic()
+    @staticmethod
+    def record_values(index: int, record: ModRecord) -> List[str]:
+        metadata = record.metadata
+        candidate = record.candidate
+        mcmod_candidate = next((item for item in record.candidates if item.source == "MC百科"), None)
+        install_candidate = mcmod_candidate or candidate
+        client = map_side(install_candidate.client_side, "客户端") if install_candidate and install_candidate.client_side else "未知"
+        server = map_side(install_candidate.server_side, "服务端") if install_candidate and install_candidate.server_side else "未知"
+        if mcmod_candidate:
+            client = mcmod_candidate.client_side or client
+            server = mcmod_candidate.server_side or server
+        name = candidate.name if candidate else (metadata.names[0] if metadata.names else "")
+        author = "\n".join(metadata.authors) or ("\n".join(candidate.authors) if candidate else "")
+        description = metadata.description or (candidate.description if candidate else "")
+        links = "\n".join(unique([url for item in record.candidates for url in ([item.url] + item.source_urls) if url]))
+        return [
+            index, record.filename, "\n".join(metadata.mod_ids), name,
+            mcmod_candidate.chinese_name if mcmod_candidate else (candidate.chinese_name if candidate else ""), author,
+            "\n".join(metadata.versions), metadata.loader, client, server,
+            description, links, record.confidence, "\n".join(record.status),
+        ]
 
-    def _request(self, url, stage, file_name, params=None) -> Optional[requests.Response]:
+    @staticmethod
+    def format_sheet(sheet, last_row: int):
+        used = sheet.range(1, 1).resize(last_row, len(OUTPUT_HEADERS))
+        used.api.WrapText = True
+        for column, width in SHEET_COLUMN_WIDTHS.items():
+            column_range = sheet.range(column)
+            column_range.column_width = width
+            column_range.api.WrapText = column in WRAPPED_COLUMNS
+        sheet.range("1:1").api.Font.Bold = True
+        sheet.range("1:1").row_height = 24
+        for row in range(2, last_row + 1):
+            values = sheet.range(row, 1).resize(1, len(OUTPUT_HEADERS)).value
+            sheet.range(row, 1).row_height = Manager.calculate_row_height(values)
+
+    @staticmethod
+    def calculate_row_height(values: Sequence[object]) -> float:
+        max_lines = 1
+        for index, value in enumerate(values):
+            text = str(value or "")
+            column = chr(ord("A") + index) + ":" + chr(ord("A") + index)
+            width = SHEET_COLUMN_WIDTHS[column]
+            lines = sum(max(1, (len(part) + max(1, int(width * 1.6)) - 1) // max(1, int(width * 1.6))) for part in text.splitlines() or [""])
+            max_lines = max(max_lines, lines)
+        return min(300, max(20, 16 * max_lines + 4))
+
+    def analyze_jar(self, filename: str, metadata: JarMetadata) -> ModRecord:
+        terms = derive_search_terms(filename, metadata)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {
+                "MC百科": pool.submit(self.search_mcmod, terms, filename),
+                "Modrinth": pool.submit(self.search_modrinth, terms, filename),
+            }
+            direct_results = []
+            for source, future in futures.items():
+                try:
+                    direct_results.append(future.result())
+                except Exception:
+                    direct_results.append(SearchResult(source, "请求失败"))
+        results = {result.source: result for result in direct_results}
+        missing = [source for source, result in results.items() if not result.candidates]
+        # CurseForge has no direct adapter in this workflow, so it is always
+        # discovered through Bing. Missing direct sources receive the same
+        # site-limited discovery fallback.
+        discovered = self.discover_bing(unique(missing + ["CurseForge"]), terms, filename)
+        bing_status = "已发现" if any(result.candidates for result in discovered.values()) else (
+            "请求失败" if discovered and all(result.failed for result in discovered.values()) else "未找到"
+        )
+        results["Bing"] = SearchResult("Bing", bing_status)
+        for source, result in discovered.items():
+            target = results.setdefault(source, SearchResult(source))
+            target.candidates.extend(result.candidates)
+            target.candidates = self.deduplicate(target.candidates)
+            if result.candidates:
+                target.status = "已发现"
+            elif target.status != "已发现" and result.failed:
+                target.status = "请求失败"
+        for source in ("MC百科", "Modrinth", "CurseForge"):
+            results.setdefault(source, SearchResult(source))
+        candidates = self.confirm_candidates(results, metadata, filename)
+        return self.build_record(filename, metadata, candidates, results)
+
+    def search_mcmod(self, terms: Sequence[str], filename: str) -> SearchResult:
+        candidates = []
+        completed = False
+        for term in terms:
+            response = self.request("https://search.mcmod.cn/s", "MC百科搜索", filename, {"key": term, "filter": 1})
+            if response is None:
+                continue
+            completed = True
+            if etree is None:
+                continue
+            tree = etree.HTML(response.text)
+            for element in tree.xpath("//div[contains(@class,'result-item')]//a[@target='_blank']"):
+                url = element.get("href", "")
+                if url and is_allowed_url(url, "MC百科"):
+                    candidates.append(SearchCandidate("MC百科", url, " ".join(element.xpath(".//text()")).strip(), slug=self.url_slug(url)))
+        status = "已发现" if candidates else ("未找到" if completed else "请求失败")
+        return SearchResult("MC百科", status, self.deduplicate(candidates))
+
+    def search_modrinth(self, terms: Sequence[str], filename: str) -> SearchResult:
+        candidates = []
+        completed = False
+        for term in terms:
+            response = self.request("https://api.modrinth.com/v2/search", "Modrinth搜索", filename, {"query": term, "limit": 20, "facets": '[ ["project_type:mod"] ]'})
+            if response is None:
+                continue
+            completed = True
+            try:
+                hits = response.json().get("hits", [])
+            except (ValueError, AttributeError):
+                continue
+            for hit in hits:
+                slug = hit.get("slug", "")
+                candidates.append(SearchCandidate("Modrinth", "https://modrinth.com/mod/" + slug, hit.get("title", ""), slug=slug, project_id=hit.get("project_id", ""), authors=[hit.get("author", "")], description=hit.get("description", "")))
+        status = "已发现" if candidates else ("未找到" if completed else "请求失败")
+        return SearchResult("Modrinth", status, self.deduplicate(candidates))
+
+    def discover_bing(self, sources: Sequence[str], terms: Sequence[str], filename: str) -> Dict[str, SearchResult]:
+        discovered = {}
+        for source in unique(sources):
+            candidates = []
+            completed = False
+            for term in terms:
+                response = self.request("https://www.bing.com/search", "Bing搜索", filename, {"q": 'site:%s "%s"' % (SOURCE_SEARCH_SCOPES[source], term), "count": 10, "setlang": "zh-CN", "ensearch": 1})
+                if response is None:
+                    continue
+                completed = True
+                if etree is None:
+                    continue
+                for element in etree.HTML(response.text).xpath("//li[contains(@class,'b_algo')]//h2/a"):
+                    url = element.get("href", "")
+                    if is_allowed_url(url, source):
+                        candidates.append(SearchCandidate(source, url, " ".join(element.xpath(".//text()")).strip(), slug=self.url_slug(url)))
+            status = "已发现" if candidates else ("未找到" if completed else "请求失败")
+            discovered[source] = SearchResult(source, status, self.deduplicate(candidates))
+        return discovered
+
+    @staticmethod
+    def deduplicate(candidates: Sequence[SearchCandidate]) -> List[SearchCandidate]:
+        unique_candidates = {}
+        for candidate in candidates:
+            key = (candidate.source, candidate.url.split("#", 1)[0].rstrip("/"), normalize_identifier(candidate.slug))
+            unique_candidates.setdefault(key, candidate)
+        return list(unique_candidates.values())
+
+    def confirm_candidates(self, results: Dict[str, SearchResult], metadata: JarMetadata, filename: str) -> List[SearchCandidate]:
+        all_candidates = []
+        for source, result in results.items():
+            for candidate in result.candidates:
+                candidate.score = self.score_candidate(candidate, metadata, filename)
+                if candidate.score <= 0:
+                    continue
+                try:
+                    detailed = self.load_candidate_details(candidate, filename)
+                except Exception:
+                    detailed = None
+                if detailed:
+                    detailed.confirmed = True
+                    all_candidates.append(detailed)
+        grouped = {}
+        for candidate in all_candidates:
+            key = normalize_identifier(candidate.project_id) or normalize_identifier(candidate.slug) or normalize_identifier(self.url_slug(candidate.url))
+            if not key:
+                key = candidate.url.split("#", 1)[0].rstrip("/")
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = candidate
+            else:
+                existing.source_urls = unique(existing.source_urls + [candidate.url] + candidate.source_urls)
+                if candidate.score > existing.score:
+                    candidate.source_urls = unique(candidate.source_urls + [existing.url] + existing.source_urls)
+                    grouped[key] = candidate
+        result = list(grouped.values())
+        result.sort(key=lambda candidate: candidate.score, reverse=True)
+        return result
+
+    def score_candidate(self, candidate: SearchCandidate, metadata: JarMetadata, filename: str) -> int:
+        identifiers = [normalize_identifier(value) for value in metadata.mod_ids]
+        names = [normalize_identifier(value) for value in metadata.names]
+        file_terms = [normalize_identifier(value) for value in derive_search_terms(filename, JarMetadata())]
+        values = [normalize_identifier(candidate.project_id), normalize_identifier(candidate.slug), normalize_identifier(candidate.name), normalize_identifier(self.url_slug(candidate.url))]
+        score = 0
+        if any(identifier and identifier == values[0] for identifier in identifiers): score = max(score, 100)
+        if any(identifier and identifier == values[1] for identifier in identifiers): score = max(score, 90)
+        if any(name and name == values[2] for name in names): score = max(score, 80)
+        if any(term and term in values for term in file_terms): score = max(score, 70)
+        if score == 0 and any(name and name in values[2] for name in names): score = 20
+        if score == 0: return 0
+        loader_name = (metadata.loader or "").casefold()
+        if any(loader_name == str(value).casefold() for value in candidate.loaders) or loader_name in candidate.name.casefold(): score += 10
+        if any(version in candidate.versions for version in metadata.versions): score += 10
+        if re.search(r"resource-pack|modpack|plugin|shader", (candidate.name + " " + candidate.url).lower()): return 0
+        return score
+
+    def load_candidate_details(self, candidate: SearchCandidate, filename: str) -> Optional[SearchCandidate]:
+        if candidate.source == "Modrinth":
+            response = self.request("https://api.modrinth.com/v2/project/" + candidate.slug, "Modrinth详情", filename)
+            if response is None:
+                return None
+            try:
+                data = response.json()
+            except (ValueError, AttributeError):
+                return None
+            candidate.name = data.get("title", candidate.name)
+            candidate.description = data.get("description", candidate.description)
+            candidate.client_side = data.get("client_side", "")
+            candidate.server_side = data.get("server_side", "")
+            candidate.loaders = data.get("loaders", [])
+            candidate.versions = data.get("game_versions", [])
+            return candidate
+        response = self.request(candidate.url, candidate.source + "详情", filename)
+        if response is None or etree is None:
+            return None
+        tree = etree.HTML(response.text)
+        candidate.name = candidate.name or " ".join(tree.xpath("//title/text()")).strip()
+        candidate.description = candidate.description or " ".join(tree.xpath("//meta[@name='description']/@content | //meta[@property='og:description']/@content"))
+        if candidate.source == "MC百科":
+            candidate.chinese_name = candidate.name.split("(")[0].strip()
+            body = " ".join(tree.xpath("//body//text()"))
+            for value in ("客户端需装", "客户端可选", "客户端无效"):
+                if value in body: candidate.client_side = value; break
+            for value in ("服务端需装", "服务端可选", "服务端无效"):
+                if value in body: candidate.server_side = value; break
+            candidate.versions = versions_from_text(body)
+        return candidate
+
+    def build_record(self, filename: str, metadata: JarMetadata, candidates: Sequence[SearchCandidate], results: Dict[str, SearchResult]) -> ModRecord:
+        status = []
+        for source in ("MC百科", "Modrinth", "Bing", "CurseForge"):
+            result = results.get(source, SearchResult(source))
+            matched = any(candidate.source == source for candidate in candidates)
+            status.append(source + "=" + ("已匹配" if matched else result.status))
+        if metadata.multiple: status.append("多 Mod JAR，需人工审核")
+        if not candidates:
+            source_results = [results.get(source, SearchResult(source)) for source in ("MC百科", "Modrinth", "CurseForge")]
+            confidence = "请求失败" if all(result.failed for result in source_results) else "未找到"
+            return ModRecord(filename=filename, metadata=metadata, confidence=confidence, status=status)
+        best = candidates[0]
+        close = len(candidates) > 1 and best.score - candidates[1].score <= 10
+        confidence = "低，需人工审核" if metadata.multiple or close else ("高" if best.score >= 80 else "低，需人工审核")
+        if len(candidates) > 1: status.append("候选数量=" + str(len(candidates)))
+        return ModRecord(filename=filename, metadata=metadata, candidate=best, candidates=list(candidates), confidence=confidence, status=status)
+
+    def read_jar_metadata(self, jar_path: str) -> JarMetadata:
+        try:
+            with zipfile.ZipFile(jar_path) as jar:
+                names = set(jar.namelist())
+                for file_name, loader in (("META-INF/neoforge.mods.toml", "NeoForge"), ("META-INF/mods.toml", "Forge")):
+                    if file_name in names:
+                        return self.parse_toml(jar.read(file_name).decode("utf-8", "ignore"), loader)
+                for file_name, loader in (("fabric.mod.json", "Fabric"), ("quilt.mod.json", "Quilt")):
+                    if file_name in names:
+                        return self.parse_json(jar.read(file_name), loader)
+        except (OSError, zipfile.BadZipFile) as error:
+            return JarMetadata(error=type(error).__name__)
+        return JarMetadata()
+
+    @staticmethod
+    def parse_toml(content: str, loader: str) -> JarMetadata:
+        blocks = re.split(r"\[\[mods\]\]", content)[1:]
+        mod_ids, names = [], []
+        for block in blocks:
+            mod_id = re.search(r"^\s*modId\s*=\s*[\"']([^\"']+)", block, re.M)
+            display_name = re.search(r"^\s*displayName\s*=\s*[\"']([^\"']+)", block, re.M)
+            if mod_id: mod_ids.append(mod_id.group(1))
+            if display_name: names.append(display_name.group(1))
+        authors = []
+        for raw_authors in re.findall(r"^\s*authors?\s*=\s*(.+)$", content, re.M):
+            authors.extend(re.findall(r"[\"']([^\"']+)[\"']", raw_authors))
+        description = re.search(r"^\s*description\s*=\s*[\"']([^\"']+)", content, re.M)
+        versions = toml_minecraft_versions(content)
+        return JarMetadata(unique(mod_ids), unique(names), unique(authors), description.group(1) if description else "", versions, loader)
+
+    @staticmethod
+    def parse_json(raw: bytes, loader: str) -> JarMetadata:
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return JarMetadata(loader=loader, error="JSON 解析失败")
+        if loader == "Quilt":
+            data = data.get("quilt_loader", {})
+            metadata = data.get("metadata", {})
+            entry = {**data, **metadata}
+        else:
+            entry = data
+        authors = entry.get("authors", [])
+        authors = [item.get("name", "") if isinstance(item, dict) else str(item) for item in (authors if isinstance(authors, list) else [authors])]
+        versions = json_minecraft_versions(data, loader)
+        return JarMetadata([entry.get("id", "")], [entry.get("name", "")], unique(authors), entry.get("description", ""), unique(versions), loader)
+
+    def wait_for_rate_limit(self):
+        if not hasattr(self, "_request_lock"):
+            self._request_lock = threading.Lock()
+        with self._request_lock:
+            interval, now = 1 / MAX_REQUESTS_PER_SECOND, time.monotonic()
+            if self._last_request_time is not None and interval - (now - self._last_request_time) > 0:
+                time.sleep(interval - (now - self._last_request_time))
+            self._last_request_time = time.monotonic()
+
+    def request(self, url: str, stage: str, filename: str, params=None):
         for attempt in range(MAX_RETRIES + 1):
-            self._wait_for_rate_limit()
+            self.wait_for_rate_limit()
             try:
                 response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                    self.log_retry(stage, filename, attempt + 1, "HTTP " + str(response.status_code))
+                    time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt)); continue
                 if response.status_code in RETRYABLE_STATUS_CODES:
-                    if attempt < MAX_RETRIES:
-                        self._log_retry(stage, file_name, attempt + 1, response.status_code)
-                        time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
-                        continue
-                    self._log_failure(stage, file_name, "HTTP " + str(response.status_code))
+                    self.log_failure(stage, filename, "HTTP " + str(response.status_code))
                     return None
                 response.raise_for_status()
                 return response
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
                 if attempt < MAX_RETRIES:
-                    self._log_retry(stage, file_name, attempt + 1, type(error).__name__)
-                    time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
-                    continue
-                self._log_failure(stage, file_name, type(error).__name__)
-                return None
-            except requests.exceptions.HTTPError as error:
-                status_code = getattr(error.response, "status_code", "unknown")
-                self._log_failure(stage, file_name, "HTTP " + str(status_code))
+                    self.log_retry(stage, filename, attempt + 1, type(error).__name__)
+                    time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt)); continue
+                self.log_failure(stage, filename, type(error).__name__)
                 return None
             except requests.exceptions.RequestException as error:
-                self._log_failure(stage, file_name, type(error).__name__)
+                self.log_failure(stage, filename, type(error).__name__)
                 return None
         return None
 
     @staticmethod
-    def _log_retry(stage, file_name, retry_number, reason):
-        print(f"[网络重试] {file_name} {stage}: 第 {retry_number} 次重试，原因: {reason}")
+    def log_retry(stage: str, filename: str, retry_number: int, reason: str):
+        print(f"[网络重试] {filename} {stage}: 第 {retry_number} 次重试，原因: {reason}")
 
     @staticmethod
-    def _log_failure(stage, file_name, reason):
-        print(f"[网络失败] {file_name} {stage}: {reason}")
+    def log_failure(stage: str, filename: str, reason: str):
+        print(f"[网络失败] {filename} {stage}: {reason}")
 
-    def getModName(self, modFileName):
-        if re.search(r"\.jar$", modFileName):  # Check if is jar file
-            with zipfile.ZipFile("./mods/" + modFileName, 'r') as jarfile:
-                infiles = jarfile.namelist()
-                for infile in infiles:
-                    if re.search(r"mods.toml$", infile):
-                        content = jarfile.read(infile).decode("UTF-8", errors="ignore")
-                        modName = re.search(r"displayName=\"(.+)\"", content)
-                        if modName:
-                            return modName.group(1)
-        return None
+    @staticmethod
+    def url_slug(url: str) -> str:
+        parts = [part for part in url.split("?")[0].rstrip("/").split("/") if part]
+        return parts[-1] if parts else ""
 
-    def simplifyName(self, name):
-        finder = re.compile(r"^([a-zA-Z'_]*)?(【(.*)】)?([a-zA-Z'_]*)")
-        findResult = finder.search(name)
-        if findResult.group(3) is None:
-            return findResult.group(1)
-        else:
-            if findResult.group(3) == "前置":
-                return findResult.group(4)
-            else:
-                return findResult.group(4)
 
-    def loadSearchWeb(self, modName, fileName="未知文件"):
-        params = {
-            "key": modName,
-            "filter": 1,
-        }
-        response = self._request("https://search.mcmod.cn/s", "搜索", fileName, params=params)
-        if response is None:
-            return False
-        with open("searchWeb.html", "w", encoding="UTF-8") as f:
-            f.write(response.text)
-        return True
-
-    def getModname2UrlDic(self, searchWebSrc="searchWeb.html"):
-        parser = etree.HTMLParser(recover=True, encoding="UTF-8")
-        tree = etree.parse(searchWebSrc, parser=parser)
-        elements = tree.xpath("//div[@class='result-item']/div[@class='head']/a[@target='_blank']")
-        # for element in elements:
-        #     # d = etree.tostring(element, encoding="UTF-8").decode("UTF-8")
-        #
-        #     # print(element.get("href"))
-        #     # print('*' * 50)
-        # for element in elements:
-        # print(' '.join(etree.tostring(element, method="text", encoding="UTF-8").decode("UTF-8").split()))
-        # print('*' * 50)
-        # print(etree.tostring(tree, encoding="UTF-8").decode("UTF-8"))
-        modname2UrlDic = {}
-        for element in elements:
-            modname2UrlDic[
-                ' '.join(
-                    etree.tostring(element, method="text", encoding="UTF-8").decode("UTF-8").split())] = element.get(
-                "href")
-        # print(modname2UrlDic)
-        # print('-' * 50)
-        return modname2UrlDic
-
-    def isServerNeeded(self, modUrl, fileName="未知文件"):
-        response = self._request(modUrl, "详情", fileName)
-        if response is None:
-            return None
-        # Store the mod web file
-        with open("modWeb.html", "w", encoding="UTF-8") as f:
-            f.write(response.text)
-        # Parse the mod web file
-        parser = etree.HTMLParser(recover=True, encoding="UTF-8")
-        tree = etree.parse("modWeb.html", parser=parser)
-        elements = tree.xpath("//div[@class='class-info']//ul[@class='col-lg-12']/li[@class='col-lg-4']")
-
-        for element in elements:
-            str = etree.tostring(element, encoding="UTF-8", method="text").decode("UTF-8")
-            if re.search("服务端需装", str):
-                return "服务端需装"
-            if re.search("服务端无效", str):
-                return "服务端无效"
-            if re.search("服务端可选", str):
-                return "服务端可选"
-        return "未知" + '[' + modUrl + ']'
-
-    def isForgeMod(self, fileName):
-        with zipfile.ZipFile("./mods/" + fileName, 'r') as jarfile:
-            infiles = jarfile.namelist()
-            for infile in infiles:
-                if re.search(r"mods.toml$", infile):
-                    return True
-        return False
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     Manager("./mods")

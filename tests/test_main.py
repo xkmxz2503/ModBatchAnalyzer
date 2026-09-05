@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from contextlib import redirect_stdout
@@ -8,9 +10,19 @@ from io import StringIO
 from unittest.mock import MagicMock, patch
 
 from Main import (
+    GROUP_SIZE,
+    MAX_MOD_WORKERS,
     OUTPUT_HEADERS,
+    CandidateComponent,
+    ECSWorld,
+    FileComponent,
     JarMetadata,
     Manager,
+    MetadataComponent,
+    ModRecord,
+    RecordComponent,
+    SearchComponent,
+    SearchPipeline,
     SearchCandidate,
     SearchResult,
     derive_search_terms,
@@ -23,6 +35,9 @@ def make_manager():
     manager = Manager.__new__(Manager)
     manager._request_lock = __import__("threading").Lock()
     manager._last_request_time = None
+    manager._limiters = {}
+    manager._active_pipeline = None
+    manager._entity_local = threading.local()
     return manager
 
 
@@ -116,6 +131,186 @@ class PureLogicTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def make_jar(self, directory, filename, mod_id):
+        with zipfile.ZipFile(os.path.join(directory, filename), "w") as archive:
+            archive.writestr("fabric.mod.json", json.dumps({"id": mod_id}))
+
+    def test_directory_analyzes_jars_concurrently_and_writes_completed_entities_immediately(self):
+        item = make_manager()
+        active = 0
+        peak_active = 0
+        started = 0
+        lock = threading.Lock()
+        calls, worker_threads = [], []
+        barrier = threading.Barrier(MAX_MOD_WORKERS)
+        filenames = ["first.jar", "second.jar", "third.jar", "fourth.jar", "fifth.jar"]
+
+        class Cell:
+            def __init__(self, sheet, key):
+                self.sheet = sheet
+                self.key = key
+
+            @property
+            def value(self):
+                return self.sheet.values.get(self.key)
+
+            @value.setter
+            def value(self, value):
+                self.sheet.values[self.key] = value
+                self.sheet.write_threads.append(threading.get_ident())
+
+        class Sheet:
+            def __init__(self):
+                self.values = {}
+                self.write_threads = []
+
+            def range(self, *args):
+                return Cell(self, args)
+
+        sheet = Sheet()
+
+        def analyze(filename, metadata):
+            nonlocal active, peak_active, started
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                started += 1
+                sequence = started
+                worker_threads.append(threading.get_ident())
+            if sequence <= MAX_MOD_WORKERS:
+                barrier.wait(timeout=1)
+            time.sleep(0.03 if filename == "first.jar" else 0.01)
+            with lock:
+                active -= 1
+                calls.append(filename)
+            return ModRecord(filename=filename, metadata=metadata, status=["MC百科=未找到"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in filenames:
+                self.make_jar(directory, filename, filename.removesuffix(".jar"))
+            workbook = MagicMock()
+            workbook.sheets.__getitem__.return_value = sheet
+            with patch("Main.xw") as excel, patch("Main.os.listdir", return_value=filenames), patch.object(SearchPipeline, "process", autospec=True, side_effect=lambda pipeline, filename, metadata, **kwargs: analyze(filename, metadata)), patch.object(item, "format_sheet"):
+                excel.Book.return_value = workbook
+                output = StringIO()
+                with redirect_stdout(output):
+                    item.analyze_directory(directory)
+
+        self.assertCountEqual(calls, filenames)
+        self.assertEqual(peak_active, MAX_MOD_WORKERS)
+        self.assertTrue(all(thread_id != threading.get_ident() for thread_id in worker_threads))
+        self.assertTrue(all(thread_id == threading.get_ident() for thread_id in sheet.write_threads))
+        written_filenames = [sheet.values[(row, 1)][1] for row in range(2, 7)]
+        self.assertCountEqual(written_filenames, filenames)
+        self.assertNotEqual(written_filenames[0], "first.jar")
+        self.assertTrue(all(sheet.values[(row, 1)][12] == "未找到" for row in range(2, 7)))
+        result_lines = [line for line in output.getvalue().splitlines() if line.startswith("[结果]")]
+        self.assertEqual([line.split()[1] for line in result_lines], written_filenames)
+        self.assertNotIn("[文件失败]", output.getvalue())
+
+    def test_file_task_failure_is_isolated_to_its_record(self):
+        item = make_manager()
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_jar(directory, "broken.jar", "broken")
+            with patch.object(item, "analyze_jar", side_effect=RuntimeError):
+                metadata, record = item.analyze_file(directory, "broken.jar")
+
+        self.assertEqual(metadata.mod_ids, ["broken"])
+        self.assertEqual(record.confidence, "请求失败")
+        self.assertEqual(record.status, ["MC百科=请求失败", "Modrinth=请求失败", "Bing=请求失败", "CurseForge=请求失败"])
+
+    def test_failed_file_does_not_stop_other_files_in_the_same_batch(self):
+        item = make_manager()
+        records = {}
+
+        def analyze(filename, metadata):
+            if filename == "failed.jar":
+                raise RuntimeError
+            return ModRecord(filename=filename, metadata=metadata, status=["MC百科=未找到"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            filenames = ["good.jar", "failed.jar", "later.jar"]
+            for filename in filenames:
+                self.make_jar(directory, filename, filename.removesuffix(".jar"))
+            workbook = MagicMock()
+            sheet = MagicMock()
+            workbook.sheets.__getitem__.return_value = sheet
+            with patch("Main.xw") as excel, patch("Main.os.listdir", return_value=filenames), patch.object(SearchPipeline, "process", autospec=True, side_effect=lambda pipeline, filename, metadata, **kwargs: analyze(filename, metadata)), patch.object(item, "record_values", side_effect=lambda index, record: records.setdefault(record.filename, record) and [record.filename]), patch.object(item, "format_sheet"):
+                excel.Book.return_value = workbook
+                output = StringIO()
+                with redirect_stdout(output):
+                    item.analyze_directory(directory)
+
+        self.assertEqual(records["failed.jar"].confidence, "请求失败")
+        self.assertEqual(records["good.jar"].confidence, "未找到")
+        self.assertEqual(records["later.jar"].confidence, "未找到")
+        self.assertIn("[文件失败] failed.jar: RuntimeError。", output.getvalue())
+        self.assertIn("[完成] 已处理 3 个 JAR", output.getvalue())
+
+    def test_directory_processes_twenty_jars_per_group_before_starting_next_group(self):
+        item = make_manager()
+        filenames = [f"mod-{index:02}.jar" for index in range(GROUP_SIZE + 1)]
+        calls = []
+
+        def process(pipeline, filename, metadata, on_phase=None, **kwargs):
+            calls.append(filename)
+            if on_phase:
+                on_phase("待写入")
+            return ModRecord(filename=filename, metadata=metadata, status=["MC百科=未找到"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in filenames:
+                self.make_jar(directory, filename, filename.removesuffix(".jar"))
+            workbook = MagicMock()
+            workbook.sheets.__getitem__.return_value = MagicMock()
+            with patch("Main.xw") as excel, patch("Main.os.listdir", return_value=list(reversed(filenames))), patch.object(SearchPipeline, "process", autospec=True, side_effect=lambda pipeline, filename, metadata, **kwargs: process(pipeline, filename, metadata, **kwargs)), patch.object(item, "format_sheet"):
+                excel.Book.return_value = workbook
+                output = StringIO()
+                with redirect_stdout(output):
+                    item.analyze_directory(directory)
+
+        self.assertEqual(set(calls[:GROUP_SIZE]), set(sorted(filenames)[:GROUP_SIZE]))
+        self.assertEqual(calls[GROUP_SIZE:], [sorted(filenames)[GROUP_SIZE]])
+        self.assertIn("[组] 开始第 1/2 组，共 20 个 JAR。", output.getvalue())
+        self.assertIn("[组] 第 1/2 组完成，已处理 20 个 JAR。", output.getvalue())
+        self.assertIn("[组] 开始第 2/2 组，共 1 个 JAR。", output.getvalue())
+
+    def test_ecs_world_keeps_components_and_entity_state(self):
+        world = ECSWorld()
+        metadata = JarMetadata(mod_ids=["example"])
+        entity_id = world.create_entity(
+            FileComponent("example.jar", "mods", 1, 0),
+            MetadataComponent(metadata),
+            SearchComponent(phase="元数据完成"),
+        )
+        world.add(entity_id, CandidateComponent())
+        world.add(entity_id, RecordComponent(ModRecord("example.jar", metadata)))
+
+        self.assertEqual(world.get(entity_id, FileComponent).group_index, 1)
+        self.assertEqual(world.get(entity_id, SearchComponent).phase, "元数据完成")
+        self.assertEqual(world.entities_with(FileComponent, MetadataComponent), [entity_id])
+        self.assertTrue(world.has(entity_id, RecordComponent))
+
+    def test_pipeline_logs_all_four_queues_for_a_group(self):
+        item = make_manager()
+        metadata = JarMetadata(mod_ids=["known"])
+        direct = SearchResult("MC百科", "未找到")
+        modrinth = SearchResult("Modrinth", "未找到")
+        discovered = {
+            "MC百科": SearchResult("MC百科", "未找到"),
+            "Modrinth": SearchResult("Modrinth", "未找到"),
+            "CurseForge": SearchResult("CurseForge", "未找到"),
+        }
+        output = StringIO()
+        with patch.object(item, "search_mcmod", return_value=direct), patch.object(item, "search_modrinth", return_value=modrinth), patch.object(item, "discover_bing", return_value=discovered), redirect_stdout(output):
+            with SearchPipeline(item, 1, 2) as pipeline:
+                pipeline.process("known.jar", metadata)
+
+        text = output.getvalue()
+        for queue_name in ("MC百科", "Modrinth", "Bing", "详情"):
+            self.assertIn(f"[队列] 组 1/2 {queue_name} 开始: known.jar", text)
+            self.assertIn(f"[队列] 组 1/2 {queue_name} 完成: known.jar", text)
+
     def test_directory_logs_progress_and_skips_non_jar(self):
         item = make_manager()
         metadata = JarMetadata(mod_ids=["known"], loader="Fabric")
@@ -130,7 +325,7 @@ class PipelineTests(unittest.TestCase):
                 handle.write("ignored")
             workbook = MagicMock()
             workbook.sheets.__getitem__.return_value = MagicMock()
-            with patch("Main.xw") as excel, patch.object(item, "analyze_jar", return_value=record):
+            with patch("Main.xw") as excel, patch.object(SearchPipeline, "process", autospec=True, return_value=record):
                 excel.Book.return_value = workbook
                 output = StringIO()
                 with redirect_stdout(output):

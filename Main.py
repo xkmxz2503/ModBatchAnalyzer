@@ -1,6 +1,7 @@
 """PCL-style Minecraft mod batch analyzer."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from os import path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -25,6 +26,16 @@ except ImportError:
 
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = (5, 15)
+MAX_MOD_WORKERS = 4
+GROUP_SIZE = 20
+QUEUE_WORKERS = {"MC百科": 2, "Modrinth": 4, "Bing": 2, "详情": 4}
+RATE_LIMITS = {
+    "mcmod.cn": {"per_second": 1, "per_minute": 30},
+    "modrinth.com": {"per_second": 5, "per_minute": 240},
+    "bing.com": {"per_second": 1, "per_minute": 30},
+    "curseforge.com": {"per_second": 1, "per_minute": 30},
+}
+# 保留旧配置名，兼容外部调用和旧测试；未知站点使用此值作为每秒上限。
 MAX_REQUESTS_PER_SECOND = 50
 RETRY_BACKOFF_SECONDS = 1
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
@@ -102,6 +113,200 @@ class ModRecord:
     candidates: List[SearchCandidate] = field(default_factory=list)
     confidence: str = "未找到"
     status: List[str] = field(default_factory=list)
+    failure_reason: str = ""
+
+
+@dataclass
+class FileComponent:
+    filename: str
+    mod_directory: str
+    group_index: int
+    order: int
+
+
+@dataclass
+class MetadataComponent:
+    metadata: JarMetadata
+
+
+@dataclass
+class SearchComponent:
+    terms: List[str] = field(default_factory=list)
+    phase: str = "待读取"
+    results: Dict[str, SearchResult] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateComponent:
+    candidates: List[SearchCandidate] = field(default_factory=list)
+
+
+@dataclass
+class RecordComponent:
+    record: ModRecord
+
+
+@dataclass
+class ErrorComponent:
+    stage: str
+    error_type: str
+    reason: str
+
+
+class ECSWorld:
+    """单文件工具使用的最小 ECS：实体只由组件组成，系统负责推进状态。"""
+
+    def __init__(self):
+        self._next_entity = 1
+        self._components = defaultdict(dict)
+
+    def create_entity(self, *components: object) -> int:
+        entity_id = self._next_entity
+        self._next_entity += 1
+        for component in components:
+            self.add(entity_id, component)
+        return entity_id
+
+    def add(self, entity_id: int, component: object):
+        self._components[type(component)][entity_id] = component
+        return component
+
+    def get(self, entity_id: int, component_type: type, default=None):
+        return self._components.get(component_type, {}).get(entity_id, default)
+
+    def has(self, entity_id: int, component_type: type) -> bool:
+        return entity_id in self._components.get(component_type, {})
+
+    def entities_with(self, *component_types: type) -> List[int]:
+        if not component_types:
+            return []
+        entity_ids = set(self._components.get(component_types[0], {}))
+        for component_type in component_types[1:]:
+            entity_ids.intersection_update(self._components.get(component_type, {}))
+        return sorted(entity_ids)
+
+
+class WindowRateLimiter:
+    """线程安全的每秒 + 每分钟滑动窗口限流器。"""
+
+    def __init__(self, per_second: int, per_minute: int):
+        self.per_second = max(0, int(per_second))
+        self.per_minute = max(0, int(per_minute))
+        self._events = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            wait = 0.0
+            with self._lock:
+                now = time.monotonic()
+                while self._events and now - self._events[0] >= 60:
+                    self._events.popleft()
+                second_count = sum(event > now - 1 for event in self._events)
+                minute_count = len(self._events)
+                if self.per_second and second_count >= self.per_second:
+                    wait = max(wait, 1 - (now - next(event for event in self._events if event > now - 1)))
+                if self.per_minute and minute_count >= self.per_minute:
+                    wait = max(wait, 60 - (now - self._events[0]))
+                if wait <= 0:
+                    self._events.append(now)
+                    return
+            time.sleep(wait)
+
+
+class SearchPipeline:
+    """一个分组共享的四队列协调器。"""
+
+    def __init__(self, manager: "Manager", group_index: int = 0, total_groups: int = 0):
+        self.manager = manager
+        self.group_index = group_index
+        self.total_groups = total_groups
+        self.queues = {}
+
+    def __enter__(self):
+        self.queues = {
+            name: ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mod-" + name)
+            for name, workers in QUEUE_WORKERS.items()
+        }
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for executor in self.queues.values():
+            executor.shutdown(wait=True)
+        self.queues.clear()
+
+    def process(self, filename: str, metadata: JarMetadata, on_phase=None, on_results=None) -> ModRecord:
+        terms = derive_search_terms(filename, metadata)
+        if on_phase:
+            on_phase("直接搜索")
+        direct = {}
+        self.manager.log_pipeline(self.group_index, self.total_groups, "MC百科", "开始", filename)
+        self.manager.log_pipeline(self.group_index, self.total_groups, "Modrinth", "开始", filename)
+        futures = {
+            "MC百科": self.queues["MC百科"].submit(self.manager.search_mcmod, terms, filename),
+            "Modrinth": self.queues["Modrinth"].submit(self.manager.search_modrinth, terms, filename),
+        }
+        for source, future in futures.items():
+            try:
+                direct[source] = future.result()
+            except Exception as error:
+                direct[source] = SearchResult(source, "请求失败", error=type(error).__name__)
+            self.manager.log_pipeline(
+                self.group_index, self.total_groups, source, "完成", filename, direct[source].status
+            )
+
+        missing = [source for source, result in direct.items() if not result.candidates]
+        missing = unique(missing + ["CurseForge"])
+        if on_phase:
+            on_phase("Bing 发现")
+        self.manager.log_pipeline(
+            self.group_index, self.total_groups, "Bing", "开始", filename,
+            "目标=" + ",".join(missing),
+        )
+        bing_future = self.queues["Bing"].submit(self.manager.discover_bing, missing, terms, filename)
+        try:
+            discovered = bing_future.result()
+        except Exception as error:
+            discovered = {source: SearchResult(source, "请求失败", error=type(error).__name__) for source in missing}
+        self.manager.log_pipeline(
+            self.group_index, self.total_groups, "Bing", "完成", filename,
+            "发现=" + str(sum(len(result.candidates) for result in discovered.values())),
+        )
+
+        results = dict(direct)
+        bing_status = "已发现" if any(result.candidates for result in discovered.values()) else (
+            "请求失败" if discovered and all(result.failed for result in discovered.values()) else "未找到"
+        )
+        results["Bing"] = SearchResult("Bing", bing_status)
+        for source, result in discovered.items():
+            target = results.setdefault(source, SearchResult(source))
+            target.candidates.extend(result.candidates)
+            target.candidates = self.manager.deduplicate(target.candidates)
+            if result.candidates:
+                target.status = "已发现"
+            elif target.status != "已发现" and result.failed:
+                target.status = "请求失败"
+        for source in ("MC百科", "Modrinth", "CurseForge"):
+            results.setdefault(source, SearchResult(source))
+        if on_results:
+            on_results(results)
+        if on_phase:
+            on_phase("详情确认")
+        detail_count = sum(len(result.candidates) for result in results.values())
+        self.manager.log_pipeline(
+            self.group_index, self.total_groups, "详情", "开始", filename,
+            "候选=" + str(detail_count),
+        )
+        candidates = self.manager.confirm_candidates(
+            results, metadata, filename, detail_executor=self.queues["详情"]
+        )
+        self.manager.log_pipeline(
+            self.group_index, self.total_groups, "详情", "完成", filename,
+            "确认=" + str(len(candidates)),
+        )
+        if on_phase:
+            on_phase("汇总完成")
+        return self.manager.build_record(filename, metadata, candidates, results)
 
 
 def normalize_identifier(value: str) -> str:
@@ -198,6 +403,11 @@ class Manager:
         self.session.headers.update({"User-Agent": USER_AGENT})
         self._last_request_time = None
         self._request_lock = threading.Lock()
+        self._limiters = {}
+        self._limiters_lock = threading.Lock()
+        self._active_pipeline = None
+        self._entity_local = threading.local()
+        self._log_lock = threading.Lock()
         try:
             self.analyze_directory(mod_directory)
         finally:
@@ -207,7 +417,7 @@ class Manager:
         if xw is None:
             raise RuntimeError("生成 Excel 需要安装 xlwings")
         files = os.listdir(mod_directory)
-        jar_files = [filename for filename in files if filename.lower().endswith(".jar")]
+        jar_files = sorted(filename for filename in files if filename.lower().endswith(".jar"))
         skipped_files = [filename for filename in files if not filename.lower().endswith(".jar")]
         print(f"[开始] 发现 {len(jar_files)} 个 JAR，准备分析。")
         for filename in skipped_files:
@@ -217,24 +427,119 @@ class Manager:
         sheet.range(1, 1).value = OUTPUT_HEADERS
         row = 1
         completed = 0
-        for filename in jar_files:
-            row += 1
-            metadata = self.read_jar_metadata(path.join(mod_directory, filename))
-            if metadata.error:
-                print(f"[元数据异常] {filename}: {metadata.error}。")
-            elif metadata.multiple:
-                print(f"[元数据提示] {filename}: 多 Mod JAR，需人工审核。")
-            try:
-                record = self.analyze_jar(filename, metadata)
-            except Exception as error:
-                print(f"[文件失败] {filename}: {type(error).__name__}。")
-                record = ModRecord(filename=filename, metadata=metadata, confidence="请求失败", status=["MC百科=请求失败", "Modrinth=请求失败", "Bing=请求失败", "CurseForge=请求失败"])
-            sheet.range(row, 1).value = self.record_values(row - 1, record)
-            completed += 1
-            self.log_record(record)
+        groups = [jar_files[index:index + GROUP_SIZE] for index in range(0, len(jar_files), GROUP_SIZE)]
+        total_groups = len(groups)
+        for group_number, group in enumerate(groups, 1):
+            print(f"[组] 开始第 {group_number}/{total_groups} 组，共 {len(group)} 个 JAR。")
+            world = ECSWorld()
+            entities = []
+            for order, filename in enumerate(group):
+                try:
+                    metadata = self.read_jar_metadata(path.join(mod_directory, filename))
+                except Exception as error:
+                    metadata = JarMetadata(error=type(error).__name__)
+                entity_id = world.create_entity(
+                    FileComponent(filename, mod_directory, group_number, order),
+                    MetadataComponent(metadata),
+                    SearchComponent(),
+                )
+                if metadata.error:
+                    world.add(entity_id, ErrorComponent("元数据", metadata.error, metadata.error))
+                entities.append(entity_id)
+
+            with SearchPipeline(self, group_number, total_groups) as pipeline:
+                self._active_pipeline = pipeline
+                try:
+                    with ThreadPoolExecutor(max_workers=MAX_MOD_WORKERS, thread_name_prefix="mod-实体") as pool:
+                        futures = {pool.submit(self._run_entity, world, entity_id): entity_id for entity_id in entities}
+                        for future in as_completed(futures):
+                            entity_id = futures[future]
+                            try:
+                                future.result()
+                            except Exception as error:
+                                component = world.get(entity_id, FileComponent)
+                                metadata = world.get(entity_id, MetadataComponent).metadata
+                                record = self._failed_record(component.filename, metadata, error)
+                                world.add(entity_id, RecordComponent(record))
+                                world.add(entity_id, ErrorComponent("实体", type(error).__name__, str(error)))
+                            row, completed = self.write_entity_result(sheet, row, completed, world, entity_id)
+                finally:
+                    self._active_pipeline = None
+
+            print(f"[队列] 第 {group_number}/{total_groups} 组四阶段队列已完成。")
+            print(f"[组] 第 {group_number}/{total_groups} 组完成，已处理 {completed} 个 JAR。")
         self.format_sheet(sheet, row)
         workbook.save("result.xlsx")
         print(f"[完成] 已处理 {completed} 个 JAR，结果已保存至 result.xlsx。")
+
+    def write_entity_result(self, sheet, row: int, completed: int, world: ECSWorld, entity_id: int) -> Tuple[int, int]:
+        """由主线程在实体完成时立即写入，避免 Excel 的跨线程访问。"""
+        file_component = world.get(entity_id, FileComponent)
+        metadata = world.get(entity_id, MetadataComponent).metadata
+        record_component = world.get(entity_id, RecordComponent)
+        record = record_component.record if record_component else self._failed_record(
+            file_component.filename, metadata, RuntimeError("实体未完成")
+        )
+        row += 1
+        if metadata.error:
+            print(f"[元数据异常] {file_component.filename}: {metadata.error}。")
+        elif metadata.multiple:
+            print(f"[元数据提示] {file_component.filename}: 多 Mod JAR，需人工审核。")
+        if record.failure_reason:
+            print(f"[文件失败] {file_component.filename}: {record.failure_reason}。")
+        sheet.range(row, 1).value = self.record_values(row - 1, record)
+        self.log_record(record)
+        return row, completed + 1
+
+    def _run_entity(self, world: ECSWorld, entity_id: int):
+        file_component = world.get(entity_id, FileComponent)
+        metadata_component = world.get(entity_id, MetadataComponent)
+        search_component = world.get(entity_id, SearchComponent)
+        self._entity_local.entity_id = entity_id
+        try:
+            search_component.terms = derive_search_terms(file_component.filename, metadata_component.metadata)
+            pipeline = getattr(self, "_active_pipeline", None)
+            if pipeline is None:
+                record = self.analyze_jar(file_component.filename, metadata_component.metadata)
+            else:
+                record = pipeline.process(
+                    file_component.filename, metadata_component.metadata,
+                    on_phase=lambda phase: setattr(search_component, "phase", phase),
+                    on_results=lambda results: search_component.results.update(results),
+                )
+            world.add(entity_id, CandidateComponent(record.candidates))
+            world.add(entity_id, RecordComponent(record))
+            search_component.phase = "待写入"
+        except Exception as error:
+            record = self._failed_record(file_component.filename, metadata_component.metadata, error)
+            world.add(entity_id, ErrorComponent("实体", type(error).__name__, str(error)))
+            world.add(entity_id, RecordComponent(record))
+            search_component.phase = "完成（失败）"
+        finally:
+            try:
+                del self._entity_local.entity_id
+            except AttributeError:
+                pass
+
+    def analyze_file(self, mod_directory: str, filename: str) -> Tuple[JarMetadata, ModRecord]:
+        """在线程工作任务中读取并分析一个 JAR。"""
+        metadata = JarMetadata()
+        try:
+            metadata = self.read_jar_metadata(path.join(mod_directory, filename))
+            record = self.analyze_jar(filename, metadata)
+        except Exception as error:
+            record = self._failed_record(filename, metadata, error)
+        return metadata, record
+
+    @staticmethod
+    def _failed_record(filename: str, metadata: JarMetadata, error: Exception) -> ModRecord:
+        return ModRecord(
+            filename=filename,
+            metadata=metadata,
+            confidence="请求失败",
+            status=["MC百科=请求失败", "Modrinth=请求失败", "Bing=请求失败", "CurseForge=请求失败"],
+            failure_reason=type(error).__name__,
+        )
 
     @staticmethod
     def log_record(record: ModRecord):
@@ -242,6 +547,17 @@ class Manager:
         local = ", ".join(filter(None, ["/".join(metadata.mod_ids), metadata.loader, "/".join(metadata.versions)])) or "未识别本地元数据"
         result_name = record.candidate.name if record.candidate else "未找到可信候选"
         print(f"[结果] {record.filename} -> {local} -> {result_name} | {record.confidence} | {'；'.join(record.status)}")
+
+    def log_pipeline(self, group_index: int, total_groups: int, queue_name: str, event: str, filename: str, detail: str = ""):
+        """输出组内队列进度；锁保证并发线程的一条日志不会互相穿插。"""
+        if group_index <= 0:
+            return
+        if not hasattr(self, "_log_lock"):
+            self._log_lock = threading.Lock()
+        group = f"{group_index}/{total_groups}" if total_groups else str(group_index)
+        suffix = f" | {detail}" if detail else ""
+        with self._log_lock:
+            print(f"[队列] 组 {group} {queue_name} {event}: {filename}{suffix}")
 
     @staticmethod
     def record_values(index: int, record: ModRecord) -> List[str]:
@@ -291,40 +607,10 @@ class Manager:
         return min(300, max(20, 16 * max_lines + 4))
 
     def analyze_jar(self, filename: str, metadata: JarMetadata) -> ModRecord:
-        terms = derive_search_terms(filename, metadata)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = {
-                "MC百科": pool.submit(self.search_mcmod, terms, filename),
-                "Modrinth": pool.submit(self.search_modrinth, terms, filename),
-            }
-            direct_results = []
-            for source, future in futures.items():
-                try:
-                    direct_results.append(future.result())
-                except Exception:
-                    direct_results.append(SearchResult(source, "请求失败"))
-        results = {result.source: result for result in direct_results}
-        missing = [source for source, result in results.items() if not result.candidates]
-        # CurseForge has no direct adapter in this workflow, so it is always
-        # discovered through Bing. Missing direct sources receive the same
-        # site-limited discovery fallback.
-        discovered = self.discover_bing(unique(missing + ["CurseForge"]), terms, filename)
-        bing_status = "已发现" if any(result.candidates for result in discovered.values()) else (
-            "请求失败" if discovered and all(result.failed for result in discovered.values()) else "未找到"
-        )
-        results["Bing"] = SearchResult("Bing", bing_status)
-        for source, result in discovered.items():
-            target = results.setdefault(source, SearchResult(source))
-            target.candidates.extend(result.candidates)
-            target.candidates = self.deduplicate(target.candidates)
-            if result.candidates:
-                target.status = "已发现"
-            elif target.status != "已发现" and result.failed:
-                target.status = "请求失败"
-        for source in ("MC百科", "Modrinth", "CurseForge"):
-            results.setdefault(source, SearchResult(source))
-        candidates = self.confirm_candidates(results, metadata, filename)
-        return self.build_record(filename, metadata, candidates, results)
+        if getattr(self, "_active_pipeline", None) is not None:
+            return self._active_pipeline.process(filename, metadata)
+        with SearchPipeline(self) as pipeline:
+            return pipeline.process(filename, metadata)
 
     def search_mcmod(self, terms: Sequence[str], filename: str) -> SearchResult:
         candidates = []
@@ -390,12 +676,16 @@ class Manager:
             unique_candidates.setdefault(key, candidate)
         return list(unique_candidates.values())
 
-    def confirm_candidates(self, results: Dict[str, SearchResult], metadata: JarMetadata, filename: str) -> List[SearchCandidate]:
+    def confirm_candidates(self, results: Dict[str, SearchResult], metadata: JarMetadata, filename: str, detail_executor=None) -> List[SearchCandidate]:
         all_candidates = []
+        futures = []
         for source, result in results.items():
             for candidate in result.candidates:
                 candidate.score = self.score_candidate(candidate, metadata, filename)
                 if candidate.score <= 0:
+                    continue
+                if detail_executor is not None:
+                    futures.append((candidate, detail_executor.submit(self.load_candidate_details, candidate, filename)))
                     continue
                 try:
                     detailed = self.load_candidate_details(candidate, filename)
@@ -404,6 +694,14 @@ class Manager:
                 if detailed:
                     detailed.confirmed = True
                     all_candidates.append(detailed)
+        for candidate, future in futures:
+            try:
+                detailed = future.result()
+            except Exception:
+                detailed = None
+            if detailed:
+                detailed.confirmed = True
+                all_candidates.append(detailed)
         grouped = {}
         for candidate in all_candidates:
             key = normalize_identifier(candidate.project_id) or normalize_identifier(candidate.slug) or normalize_identifier(self.url_slug(candidate.url))
@@ -536,6 +834,7 @@ class Manager:
         return JarMetadata([entry.get("id", "")], [entry.get("name", "")], unique(authors), entry.get("description", ""), unique(versions), loader)
 
     def wait_for_rate_limit(self):
+        """兼容旧调用的全局每秒限流；新请求走按域名限流器。"""
         if not hasattr(self, "_request_lock"):
             self._request_lock = threading.Lock()
         with self._request_lock:
@@ -544,9 +843,34 @@ class Manager:
                 time.sleep(interval - (now - self._last_request_time))
             self._last_request_time = time.monotonic()
 
+    def _limiter_for_url(self, url: str) -> Optional[WindowRateLimiter]:
+        if not hasattr(self, "_limiters"):
+            return None
+        host = source_url_host(url)
+        if host == "www.bing.com":
+            host = "bing.com"
+        domain = next((value for value in RATE_LIMITS if host == value or host.endswith("." + value)), None)
+        if domain is None:
+            return None
+        if not hasattr(self, "_limiters_lock"):
+            self._limiters_lock = threading.Lock()
+        with self._limiters_lock:
+            limiter = self._limiters.get(domain)
+            if limiter is None:
+                config = RATE_LIMITS[domain]
+                limiter = self._limiters[domain] = WindowRateLimiter(config["per_second"], config["per_minute"])
+            return limiter
+
+    def _wait_for_request_limit(self, url: str):
+        limiter = self._limiter_for_url(url)
+        if limiter is None:
+            self.wait_for_rate_limit()
+        else:
+            limiter.acquire()
+
     def request(self, url: str, stage: str, filename: str, params=None):
         for attempt in range(MAX_RETRIES + 1):
-            self.wait_for_rate_limit()
+            self._wait_for_request_limit(url)
             try:
                 response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:

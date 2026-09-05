@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -7,7 +8,7 @@ from unittest.mock import patch
 
 import requests
 
-from Main import Manager, USER_AGENT
+from Main import Manager, RATE_LIMITS, USER_AGENT, WindowRateLimiter
 
 
 class FakeResponse:
@@ -41,11 +42,54 @@ def make_manager(session):
     manager = Manager.__new__(Manager)
     manager.session = session
     manager._last_request_time = None
+    manager._limiters = {}
     manager.session.headers.update({"User-Agent": USER_AGENT})
     return manager
 
 
 class NetworkTests(unittest.TestCase):
+    def test_domain_limiter_uses_second_and_minute_windows(self):
+        clock = [0.0]
+
+        def monotonic():
+            return clock[0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        limiter = WindowRateLimiter(per_second=1, per_minute=2)
+        with patch("Main.time.monotonic", side_effect=monotonic), patch("Main.time.sleep", side_effect=sleep):
+            limiter.acquire()
+            clock[0] = 0.1
+            limiter.acquire()
+            self.assertAlmostEqual(clock[0], 1.0, places=6)
+            clock[0] = 1.1
+            limiter.acquire()
+            self.assertAlmostEqual(clock[0], 60.0, places=6)
+
+    def test_request_selects_limiter_by_target_domain(self):
+        manager = make_manager(FakeSession([FakeResponse()]))
+        limiter = manager._limiters.setdefault("modrinth.com", WindowRateLimiter(**RATE_LIMITS["modrinth.com"]))
+        with patch.object(limiter, "acquire") as acquire:
+            self.assertIsNotNone(manager.request("https://api.modrinth.com/v2/search", "搜索", "example.jar"))
+        acquire.assert_called_once_with()
+
+    def test_concurrent_first_domain_access_shares_one_limiter(self):
+        manager = make_manager(FakeSession([]))
+        barrier = threading.Barrier(8)
+        limiters = []
+
+        def get_limiter():
+            barrier.wait()
+            limiters.append(manager._limiter_for_url("https://api.modrinth.com/v2/search"))
+
+        threads = [threading.Thread(target=get_limiter) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len({id(limiter) for limiter in limiters}), 1)
+
     def test_request_uses_session_and_timeout(self):
         session = FakeSession([
             FakeResponse(text="<html><body>search</body></html>"),

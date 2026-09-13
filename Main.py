@@ -43,8 +43,8 @@ RETRY_BACKOFF_SECONDS = 1
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 OUTPUT_HEADERS = [
-    "序号", "Mod 文件名", "Mod ID", "名称", "中文名", "作者", "Minecraft 版本",
-    "加载器", "客户端安装", "服务端安装", "简介", "来源链接", "匹配置信度", "查询状态",
+    "序号", "Mod 文件名", "服务端安装", "客户端安装", "Mod ID", "名称", "中文名",
+    "匹配置信度", "Minecraft 版本", "加载器", "作者", "来源链接", "查询状态",
 ]
 LOADERS = ("Forge", "NeoForge", "Fabric", "Quilt")
 SOURCE_DOMAINS = {"MC百科": "mcmod.cn", "Modrinth": "modrinth.com", "CurseForge": "curseforge.com"}
@@ -54,11 +54,11 @@ SOURCE_SEARCH_SCOPES = {
     "CurseForge": "curseforge.com/minecraft/mc-mods",
 }
 SHEET_COLUMN_WIDTHS = {
-    "A:A": 7, "B:B": 34, "C:C": 22, "D:D": 24, "E:E": 20, "F:F": 18,
-    "G:G": 20, "H:H": 12, "I:I": 14, "J:J": 14, "K:K": 48, "L:L": 48,
-    "M:M": 18, "N:N": 36,
+    "A:A": 7, "B:B": 34, "C:C": 14, "D:D": 14, "E:E": 22, "F:F": 24,
+    "G:G": 20, "H:H": 18, "I:I": 20, "J:J": 12, "K:K": 18, "L:L": 48,
+    "M:M": 36,
 }
-WRAPPED_COLUMNS = {"B:B", "K:K", "L:L", "N:N"}
+WRAPPED_COLUMNS = {"B:B", "L:L", "M:M"}
 
 
 @dataclass
@@ -611,13 +611,12 @@ class Manager:
             server = mcmod_candidate.server_side or server
         name = candidate.name if candidate else (metadata.names[0] if metadata.names else "")
         author = "\n".join(metadata.authors) or ("\n".join(candidate.authors) if candidate else "")
-        description = metadata.description or (candidate.description if candidate else "")
         links = "\n".join(unique([url for item in record.candidates for url in ([item.url] + item.source_urls) if url]))
         return [
-            index, record.filename, "\n".join(metadata.mod_ids), name,
-            mcmod_candidate.chinese_name if mcmod_candidate else (candidate.chinese_name if candidate else ""), author,
-            "\n".join(metadata.versions), metadata.loader, client, server,
-            description, links, record.confidence, "\n".join(record.status),
+            index, record.filename, server, client, "\n".join(metadata.mod_ids), name,
+            mcmod_candidate.chinese_name if mcmod_candidate else (candidate.chinese_name if candidate else ""),
+            record.confidence, "\n".join(metadata.versions), metadata.loader, author,
+            links, "\n".join(record.status),
         ]
 
     @staticmethod
@@ -626,13 +625,15 @@ class Manager:
         used.api.WrapText = True
         for column, width in SHEET_COLUMN_WIDTHS.items():
             column_range = sheet.range(column)
-            column_range.column_width = width
+            # 使用底层 API 的 ColumnWidth 属性以确保 WPS 兼容性
+            column_range.api.ColumnWidth = width
             column_range.api.WrapText = column in WRAPPED_COLUMNS
         sheet.range("1:1").api.Font.Bold = True
-        sheet.range("1:1").row_height = 24
+        # 使用底层 API 的 RowHeight 属性以确保 WPS 兼容性
+        sheet.range("1:1").api.RowHeight = 24
         for row in range(2, last_row + 1):
             values = sheet.range(row, 1).resize(1, len(OUTPUT_HEADERS)).value
-            sheet.range(row, 1).row_height = Manager.calculate_row_height(values)
+            sheet.range(row, 1).api.RowHeight = Manager.calculate_row_height(values)
 
     @staticmethod
     def calculate_row_height(values: Sequence[object]) -> float:

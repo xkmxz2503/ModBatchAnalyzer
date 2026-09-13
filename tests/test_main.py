@@ -104,16 +104,17 @@ class PureLogicTests(unittest.TestCase):
         candidate = SearchCandidate("Modrinth", "https://modrinth.com/mod/x", "X", client_side="required", server_side="optional")
         record = item.build_record("x.jar", metadata, [candidate], {"MC百科": SearchResult("MC百科"), "Modrinth": SearchResult("Modrinth", "已发现", [candidate]), "Bing": SearchResult("Bing"), "CurseForge": SearchResult("CurseForge")})
         values = item.record_values(1, record)
-        self.assertEqual(len(OUTPUT_HEADERS), 14)
-        self.assertEqual(len(values), 14)
-        self.assertEqual(values[8], "客户端需装")
+        self.assertEqual(len(OUTPUT_HEADERS), 13)
+        self.assertEqual(len(values), 13)
+        self.assertEqual(values[2], "服务端可选")
+        self.assertEqual(values[3], "客户端需装")
 
     def test_sheet_formatting_uses_explicit_dimensions(self):
         sheet = MagicMock()
         used = MagicMock()
         sheet.range.return_value.resize.return_value = used
         data_range = MagicMock()
-        data_range.resize.return_value.value = ["1", "长文件名" * 20] + [""] * 12
+        data_range.resize.return_value.value = ["1", "长文件名" * 20] + [""] * 11
         sheet.range.side_effect = lambda *args: sheet.range.return_value if args == (1, 1) else data_range
         Manager.format_sheet(sheet, 2)
         self.assertTrue(used.api.WrapText)
@@ -204,7 +205,7 @@ class PipelineTests(unittest.TestCase):
         written_filenames = [sheet.values[(row, 1)][1] for row in range(2, 7)]
         self.assertCountEqual(written_filenames, filenames)
         self.assertNotEqual(written_filenames[0], "first.jar")
-        self.assertTrue(all(sheet.values[(row, 1)][12] == "未找到" for row in range(2, 7)))
+        self.assertTrue(all(sheet.values[(row, 1)][7] == "未找到" for row in range(2, 7)))
         result_lines = [line for line in output.getvalue().splitlines() if line.startswith("[结果]")]
         self.assertEqual([line.split()[1] for line in result_lines], written_filenames)
         self.assertNotIn("[文件失败]", output.getvalue())

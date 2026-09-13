@@ -5,6 +5,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from os import path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse, parse_qs
+import base64
 import json
 import os
 import re
@@ -397,6 +399,43 @@ def is_allowed_url(url: str, source: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+def decode_bing_url(href: str) -> str:
+    """Decode Bing redirect URL to extract the actual target URL.
+
+    Bing search results now use redirect links like:
+    https://www.bing.com/ck/a?!&&p=...&u=a1aHR0cHM6Ly9tb2RyaW50aC5jb20vbW9kL2plaQ
+
+    The 'u' parameter contains a base64-encoded URL with a prefix (a1/a2/a3).
+    """
+    if "bing.com/ck/a" not in href:
+        return href
+
+    try:
+        parsed = urlparse(href)
+        query_params = parse_qs(parsed.query)
+        u_param = query_params.get("u", [""])[0]
+
+        if not u_param:
+            return href
+
+        # Remove the prefix (a1, a2, a3, etc.) if present
+        encoded = u_param[2:] if u_param[:2] in ("a1", "a2", "a3") else u_param
+
+        # Add padding for base64 decoding
+        encoded += "=" * (-len(encoded) % 4)
+
+        # Decode the URL
+        decoded_bytes = base64.urlsafe_b64decode(encoded)
+        decoded_url = decoded_bytes.decode("utf-8", "ignore")
+
+        # Validate the decoded URL starts with http:// or https://
+        if decoded_url and decoded_url.startswith(("http://", "https://")):
+            return decoded_url
+        return href
+    except Exception:
+        return href
+
+
 class Manager:
     def __init__(self, mod_directory: str):
         self.session = requests.Session()
@@ -661,7 +700,8 @@ class Manager:
                 if etree is None:
                     continue
                 for element in etree.HTML(response.text).xpath("//li[contains(@class,'b_algo')]//h2/a"):
-                    url = element.get("href", "")
+                    href = element.get("href", "")
+                    url = decode_bing_url(href)
                     if is_allowed_url(url, source):
                         candidates.append(SearchCandidate(source, url, " ".join(element.xpath(".//text()")).strip(), slug=self.url_slug(url)))
             status = "已发现" if candidates else ("未找到" if completed else "请求失败")

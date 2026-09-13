@@ -25,6 +25,7 @@ from Main import (
     SearchPipeline,
     SearchCandidate,
     SearchResult,
+    decode_bing_url,
     derive_search_terms,
     map_side,
     normalize_identifier,
@@ -361,6 +362,63 @@ class PipelineTests(unittest.TestCase):
             record = item.analyze_jar("known.jar", metadata)
         self.assertEqual(record.candidate.source, "Modrinth")
         self.assertIn("MC百科=请求失败", record.status)
+
+
+class BingUrlDecodingTests(unittest.TestCase):
+    def test_decode_bing_redirect_url_with_a1_prefix(self):
+        """Test decoding Bing redirect URL with a1 prefix."""
+        import base64
+        # Encode "https://modrinth.com/mod/jei"
+        target_url = "https://modrinth.com/mod/jei"
+        encoded = base64.urlsafe_b64encode(target_url.encode()).decode().rstrip("=")
+        bing_url = f"https://www.bing.com/ck/a?!&&p=test&u=a1{encoded}"
+        result = decode_bing_url(bing_url)
+        self.assertEqual(result, target_url)
+
+    def test_decode_bing_redirect_url_with_a2_prefix(self):
+        """Test decoding Bing redirect URL with a2 prefix."""
+        import base64
+        target_url = "https://www.mcmod.cn/class/459.html"
+        encoded = base64.urlsafe_b64encode(target_url.encode()).decode().rstrip("=")
+        bing_url = f"https://www.bing.com/ck/a?!&&p=test&u=a2{encoded}"
+        result = decode_bing_url(bing_url)
+        self.assertEqual(result, target_url)
+
+    def test_decode_bing_url_without_redirect_returns_original(self):
+        """Test that direct URLs are returned unchanged."""
+        direct_url = "https://modrinth.com/mod/jei"
+        result = decode_bing_url(direct_url)
+        self.assertEqual(result, direct_url)
+
+    def test_decode_bing_url_with_missing_u_param_returns_original(self):
+        """Test that Bing URLs without 'u' parameter return original."""
+        bing_url = "https://www.bing.com/ck/a?!&&p=test"
+        result = decode_bing_url(bing_url)
+        self.assertEqual(result, bing_url)
+
+    def test_decode_bing_url_with_invalid_base64_returns_original(self):
+        """Test that invalid base64 returns original URL."""
+        bing_url = "https://www.bing.com/ck/a?!&&p=test&u=invalid"
+        result = decode_bing_url(bing_url)
+        self.assertEqual(result, bing_url)
+
+    def test_decode_bing_url_with_non_http_result_returns_original(self):
+        """Test that decoded non-HTTP URLs return original."""
+        import base64
+        # Encode a non-HTTP string
+        encoded = base64.urlsafe_b64encode(b"not-a-url").decode().rstrip("=")
+        bing_url = f"https://www.bing.com/ck/a?!&&p=test&u=a1{encoded}"
+        result = decode_bing_url(bing_url)
+        self.assertEqual(result, bing_url)
+
+    def test_decode_bing_url_with_curseforge_link(self):
+        """Test decoding CurseForge URLs through Bing."""
+        import base64
+        target_url = "https://www.curseforge.com/minecraft/mc-mods/jei"
+        encoded = base64.urlsafe_b64encode(target_url.encode()).decode().rstrip("=")
+        bing_url = f"https://www.bing.com/ck/a?!&&p=abc123&u=a1{encoded}"
+        result = decode_bing_url(bing_url)
+        self.assertEqual(result, target_url)
 
 
 if __name__ == "__main__":
